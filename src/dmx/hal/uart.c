@@ -264,13 +264,20 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
     else if (intr_flags & DMX_INTR_TX_DATA) {
       // Write data to the UART and clear the interrupt
       int write_len = driver->dmx.size - driver->dmx.head;
-      dmx_uart_write_txfifo(dmx_num, &driver->dmx.data[driver->dmx.head],
-                            &write_len);
-      driver->dmx.head += write_len;
+      if(write_len > 0) {
+        dmx_uart_write_txfifo(dmx_num, &driver->dmx.data[driver->dmx.head],
+           &write_len);
+        driver->dmx.head += write_len;
+      } else {
+     // State is corrupted - reset TX
+        dmx_uart_disable_interrupt(dmx_num, DMX_INTR_TX_ALL);
+        driver->dmx.head = driver->dmx.size;  // Mark as complete
+      }
+
       dmx_uart_clear_interrupt(dmx_num, DMX_INTR_TX_DATA);
 
       // Allow FIFO to empty when done writing data
-      if (driver->dmx.head == driver->dmx.size) {
+      if (driver->dmx.head >= driver->dmx.size) {
         dmx_uart_disable_interrupt(dmx_num, DMX_INTR_TX_DATA);
       }
     } else if (intr_flags & DMX_INTR_TX_DONE) {
@@ -327,15 +334,28 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
 bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   struct dmx_uart_t *uart = &dmx_uart_context[dmx_num];
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+  periph_module_enable(PERIPH_UART0_MODULE + dmx_num);
+#else
   periph_module_enable(uart_periph_signal[dmx_num].module);
+#endif  
+
   if (dmx_num != 0) {  // Default UART port for console
 #if SOC_UART_REQUIRE_CORE_RESET
     // ESP32C3 workaround to prevent UART outputting garbage data
     uart_ll_set_reset_core(uart->dev, true);
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    periph_module_reset(PERIPH_UART0_MODULE + dmx_num);
+ #else
     periph_module_reset(uart_periph_signal[dmx_num].module);
+ #endif
     uart_ll_set_reset_core(uart->dev, false);
 #else
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    periph_module_reset(PERIPH_UART0_MODULE + dmx_num);
+ #else
     periph_module_reset(uart_periph_signal[dmx_num].module);
+ #endif
 #endif
   }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
@@ -382,7 +402,11 @@ void dmx_uart_deinit(dmx_port_t dmx_num) {
   struct dmx_uart_t *uart = &dmx_uart_context[dmx_num];
   if (uart->num != 0) {  // Default UART port for console
     esp_intr_free(uart->isr_handle);
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+    periph_module_disable(PERIPH_UART0_MODULE + dmx_num);
+#else
     periph_module_disable(uart_periph_signal[uart->num].module);
+#endif
   }
 }
 
@@ -485,6 +509,7 @@ uint32_t DMX_ISR_ATTR dmx_uart_get_txfifo_len(dmx_port_t dmx_num) {
 
 void DMX_ISR_ATTR dmx_uart_write_txfifo(dmx_port_t dmx_num, const void *buf,
                                         int *size) {
+  if(*size <= 0) return;
   struct dmx_uart_t *uart = &dmx_uart_context[dmx_num];
   const int txfifo_len = uart_ll_get_txfifo_len(uart->dev);
   if (*size > txfifo_len) *size = txfifo_len;
