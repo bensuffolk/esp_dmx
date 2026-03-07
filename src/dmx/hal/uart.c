@@ -359,31 +359,42 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
 #endif
   }
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-  uint32_t sclk_freq;
-#if CONFIG_IDF_TARGET_ESP32C6
-  // UART2 on C6 is a LP UART, with fixed GPIO pins for tx, rx, and rts
-  if (dmx_num == 2) {
-    LP_CLKRST.lpperi.lp_uart_clk_sel = 0;  // Use LP_UART_SCLK_LP_FAST
-  } else {
-    uart_ll_set_sclk(uart->dev, UART_SCLK_DEFAULT);
-  }
-  uart_get_sclk_freq(UART_SCLK_DEFAULT, &sclk_freq);
+  // IDF 5.x+: use the native UART config where possible
+  #if CONFIG_IDF_TARGET_ESP32C6
+    // UART2 on C6 is an LP UART; select LP_FAST for it
+    if (dmx_num == 2) {
+      LP_CLKRST.lpperi.lp_uart_clk_sel = 0;  // Use LP_UART_SCLK_LP_FAST
+    }
+  #endif
+  uart_config_t uart_config = {
+      .baud_rate  = DMX_BAUD_RATE,          // 250000
+      .data_bits  = UART_DATA_8_BITS,
+      .parity     = UART_PARITY_DISABLE,
+      .stop_bits  = UART_STOP_BITS_2,
+      .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT,
+  };
+  ESP_ERROR_CHECK(uart_param_config(uart->num, &uart_config));
+  // Belt-and-suspenders: ensure HW flow control remains disabled at LL
+  uart_ll_set_hw_flow_ctrl(uart->dev, UART_HW_FLOWCTRL_DISABLE, 0);
 #else
-  uart_ll_set_sclk(uart->dev, UART_SCLK_DEFAULT);
-  uart_get_sclk_freq(UART_SCLK_DEFAULT, &sclk_freq);
-#endif
-  uart_ll_set_baudrate(uart->dev, DMX_BAUD_RATE, sclk_freq);
-#else
+  // Older IDF: stick with the LL sequence
   uart_ll_set_sclk(uart->dev, UART_SCLK_APB);
   uart_ll_set_baudrate(uart->dev, DMX_BAUD_RATE);
-#endif
   uart_ll_set_mode(uart->dev, UART_MODE_UART);
   uart_ll_set_parity(uart->dev, UART_PARITY_DISABLE);
   uart_ll_set_data_bit_num(uart->dev, UART_DATA_8_BITS);
   uart_ll_set_stop_bits(uart->dev, UART_STOP_BITS_2);
+  uart_ll_set_hw_flow_ctrl(uart->dev, UART_HW_FLOWCTRL_DISABLE, 0);
+#endif
+
+  // Common post-config tweaks
   uart_ll_tx_break(uart->dev, 0);
   uart_ll_set_tx_idle_num(uart->dev, 0);
-  uart_ll_set_hw_flow_ctrl(uart->dev, UART_HW_FLOWCTRL_DISABLE, 0);
+  uart_ll_set_txfifo_empty_thr(uart->dev, DMX_UART_EMPTY_DEFAULT);
+  uart_ll_set_rxfifo_full_thr(uart->dev, DMX_UART_FULL_DEFAULT);
+  uart_ll_tx_break(uart->dev, 0);
+  uart_ll_set_tx_idle_num(uart->dev, 0);
   uart_ll_set_txfifo_empty_thr(uart->dev, DMX_UART_EMPTY_DEFAULT);
   uart_ll_set_rxfifo_full_thr(uart->dev, DMX_UART_FULL_DEFAULT);
 
@@ -395,7 +406,7 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
   esp_intr_alloc(uart_periph_signal[dmx_num].irq, isr_flags, dmx_uart_isr,
                  isr_context, &uart->isr_handle);
 
-  return uart;
+  return true;
 }
 
 void dmx_uart_deinit(dmx_port_t dmx_num) {
