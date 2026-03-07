@@ -43,27 +43,47 @@ enum {
   RDM_TYPE_IS_UNKNOWN,  // The packet is RDM, but it is unclear what type it is.
 };
 
+// Relatively large refactor of the receive ISR while debugging the issue of inserting and removing the DMX cable
 static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
   const int64_t now = dmx_timer_get_micros_since_boot();
   dmx_driver_t *const driver = arg;
   const dmx_port_t dmx_num = driver->dmx_num;
   int task_awoken = false;
+  // This variable was created to count the number of byte that are received between the DMX Breaks. This allows the 
+  // length to be updated in real time from frame to frame. Previously this code would only update the length if a break was 
+  // detected while the state machine was still processing data. However, that was the bug in this software. Because the processing 
+  // of data would get out of sync with the flow of data and the length would be incorrectly assigned. Having the length always 
+  // be validated ensures it can re-sync after framing errors on the bus
+  static uint16_t dmxFrameLengthTracker = 0;
 
+  // This is an interesting way to handle the UART receive ISR - but we will basically stay in here so long as there is data to process
   while (true) {
+    // When the ISR is triggered first obtain the interrupt flag status by reading it from the ESP peripheral register
     const uint32_t intr_flags = dmx_uart_get_interrupt_status(dmx_num);
+
+    // If there are no valid interrupt flags set then leave the ISR
     if (intr_flags == 0) break;
 
-    // DMX Receive ####################################################
+    // DMX Receive (DMX_INTR_RX_ALL) ####################################################
+    // This section of code is entered when there is either:
+    // 1) RS-485 Received Data
+    // 2) RS-485 BREAK
+    // 3) RS-485 Error (i.e. Overflow, Framing, etc)
     if (intr_flags & DMX_INTR_RX_ALL) {
-      // Read data into the DMX buffer if there is enough space
+      // If there is enough space remaining in the drivers dmx.data[] buffer then read data into the DMX buffer
       int dmx_head;
       taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
       dmx_head = driver->dmx.head;
       taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
       if (dmx_head >= 0 && dmx_head < DMX_PACKET_SIZE_MAX) {
+        // Determine how much size is available to read and store in the buffer
         int read_len = DMX_PACKET_SIZE_MAX - dmx_head;
+        // Call the low level peripheral functions to read the data. Pass in read_len as the maximum amount of data that can be read from the peripheral buffer. 
+        // If the number of bytes in the peripheral buffer is less than the read_len then read_len will be updated with how many bytes are actually available.
         dmx_uart_read_rxfifo(dmx_num, &driver->dmx.data[dmx_head], &read_len);
+        // Increment both the head pointer of the buffer as well as the new dmxFrameLengthTracker to track how much data has been read in
         dmx_head += read_len;
+        dmxFrameLengthTracker += read_len;
         taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
         driver->dmx.head = dmx_head;
         taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
@@ -77,10 +97,39 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
         }
         dmx_uart_rxfifo_reset(dmx_num);
       }
-      dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_ALL);
 
-      // Handle DMX break condition
-      if (intr_flags & DMX_INTR_RX_BREAK) {
+      // Since right above here we've read the received data from the UART peripheral it is now OK to clear the Receive Data Flag
+      dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_DATA);
+
+      // Handle UART error condition - the previous code handled the break before the error but again this could lead to race conditions when the 
+      // cable insertion and removal caused framing errors.
+      if (intr_flags & DMX_INTR_RX_ERR) {
+        // Since the receive error is being handled - clear the flag in the peripheral
+        dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_ERR);
+        // Since a receive error has just happened - also clear break flag in the peripheral so the next frame is ignored 
+        dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_BREAK);
+
+        // On error - reset all the driver variables
+        taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));      
+        driver->dmx.head = DMX_HEAD_WAITING_FOR_BREAK;
+        driver->dmx.size = DMX_PACKET_SIZE_MAX; 
+        driver->dmx.status = DMX_STATUS_IDLE;
+        driver->dmx.progress = DMX_PROGRESS_STALE;
+        // If a client was waiting on the data then raise the RTOS event to notify that the data is invalid (Improper Slot = Framing Error)
+        if (driver->task_waiting) {
+          xTaskNotifyFromISR(driver->task_waiting, DMX_ERR_IMPROPER_SLOT, eSetValueWithOverwrite, &task_awoken);
+        }  
+        taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
+        // Nothing else to do in this ISR on DMX error so break out and allow for re-entry during next ISR
+        break;  
+      } 
+      else if (intr_flags & DMX_INTR_RX_BREAK) {
+        // Handle DMX break condition - when a break has been detected it means this is the start of a brand new DMX or RDM frame
+        dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_BREAK);
+        
+        // For debugging purposes - set GPIO13 LOW when handling the UART Break ISR bits
+        // gpio_set_level(GPIO_NUM_13, 0);
+
         // Handle possible condition where expected packet size is too large
         if (driver->dmx.progress == DMX_PROGRESS_IN_DATA && dmx_head > 0) {
           taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
@@ -89,8 +138,21 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
             xTaskNotifyFromISR(driver->task_waiting, DMX_ERR_NOT_ENOUGH_SLOTS,
                                eSetValueWithOverwrite, &task_awoken);
           }
+          taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num)); 
+        }
+
+        // Now handle the condition where the DMX Frame Length has changed - this typically happens when inserting and removing the cable
+        // and data frames are not fully received. Once the data stream is consistent then the dmx.size will be equal to dmxFrameLengthTracker
+        // and this logic will no longer be executed
+        if((dmxFrameLengthTracker != 0) && (dmxFrameLengthTracker != driver->dmx.size)) {
+          taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
+          // Update dmx frame size based on how many bytes have been receieved between this BREAK and the last BREAK
+          driver->dmx.size = (dmxFrameLengthTracker - 1);  
           taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
         }
+
+        // Since this was a BREAK we can clear the dmxFrameLengthTracker back to 0 and begin counting again when the next BYTE is received
+        dmxFrameLengthTracker = 0;
 
         // Reset the DMX buffer for the next packet
         taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
@@ -98,7 +160,7 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
         driver->dmx.progress = DMX_PROGRESS_IN_BREAK;
         driver->dmx.head = 0;
         taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
-        continue;  // Nothing else to do on DMX break
+        continue;  // Nothing else to do on DMX break so continue back up to the start of the ISR and see if there is anything else to process
       } else if (driver->dmx.progress == DMX_PROGRESS_IN_BREAK ||
                  driver->dmx.progress == DMX_PROGRESS_IN_MAB) {
         taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
@@ -113,39 +175,31 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
       }
 
       // Process the data depending on the type of packet that was received
-      dmx_err_t err;
+      dmx_err_t err = DMX_OK;
       int rdm_type;
       bool packet_is_complete;
-      if (intr_flags & DMX_INTR_RX_ERR) {
-        rdm_type = RDM_TYPE_IS_NOT_RDM;
-        packet_is_complete = true;
-        err = intr_flags & DMX_INTR_RX_FIFO_OVERFLOW
-                  ? DMX_ERR_UART_OVERFLOW   // UART overflow
-                  : DMX_ERR_IMPROPER_SLOT;  // Missing stop bits
+
+      // Determine the type of the packet that was received
+      const uint8_t sc = driver->dmx.data[0];  // DMX start-code.
+      if (sc == RDM_SC) {
+        rdm_type = RDM_TYPE_IS_UNKNOWN;  // Determine actual type later
+      } 
+      else if (sc == RDM_PREAMBLE || sc == RDM_DELIMITER) {
+        rdm_type = RDM_TYPE_IS_DISCOVERY;
       } else {
-        // Determine the type of the packet that was received
-        const uint8_t sc = driver->dmx.data[0];  // DMX start-code.
-        if (sc == RDM_SC) {
-          rdm_type = RDM_TYPE_IS_UNKNOWN;  // Determine actual type later
-        } else if (sc == RDM_PREAMBLE || sc == RDM_DELIMITER) {
-          rdm_type = RDM_TYPE_IS_DISCOVERY;
-        } else {
-          rdm_type = RDM_TYPE_IS_NOT_RDM;
-          taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
-          // Get the best resolution on the controller EOP timestamp
-          driver->dmx.controller_eop_timestamp = now;
-          taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
-        }
-
-        // Set inter-slot timer for RDM response packets
-        if (driver->is_controller && rdm_type != RDM_TYPE_IS_NOT_RDM) {
-          dmx_timer_set_counter(dmx_num, 0);
-          dmx_timer_set_alarm(dmx_num, RDM_TIMING_RESPONDER_INTER_SLOT_MAX,
-                              false);
-        }
-
-        err = DMX_OK;
+        rdm_type = RDM_TYPE_IS_NOT_RDM;
+        taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
+        // Get the best resolution on the controller EOP timestamp
+        driver->dmx.controller_eop_timestamp = now;
+        taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
       }
+
+      // Set inter-slot timer for RDM response packets
+      if (driver->is_controller && rdm_type != RDM_TYPE_IS_NOT_RDM) {
+        dmx_timer_set_counter(dmx_num, 0);
+        dmx_timer_set_alarm(dmx_num, RDM_TIMING_RESPONDER_INTER_SLOT_MAX, false);
+      }
+
       while (err == DMX_OK) {
         if (rdm_type == RDM_TYPE_IS_DISCOVERY) {
           // Parse an RDM discovery response packet
@@ -240,13 +294,18 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
           driver->dmx.last_controller_pid = 0;
           driver->dmx.responder_sent_last = false;
           taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
+          // This was the bug in the previous implmenetation of the code. We were getting here in the failure case since head is greater than size so SW thinks packet is complete.
+          // This would occur immediately after the BREAK - the first slot that is processed will land us in here
           packet_is_complete = (dmx_head >= driver->dmx.size);
           break;
         }
-      }
+      } // while (err == DMX_OK) 
+
+      // When packet is not yet complete we jump back up to the top of the while(true)
       if (!packet_is_complete) {
         continue;
       }
+
       dmx_timer_stop(dmx_num);
 
       // Set driver flags and notify task
