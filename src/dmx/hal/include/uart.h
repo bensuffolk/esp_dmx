@@ -4,7 +4,7 @@
  * @brief This file is the UART Hardware Abstraction Layer (HAL) of esp_dmx. It
  * contains low-level functions to perform tasks relating to the UART hardware.
  * The UART is used to send and receive DMX and RDM packets. DMX and RDM are
- * generated using a standard UART port and transmitted using the RS-485
+ * generated using a standard UART port and transmitted using the RS-485DMX_INTR_TX_DATA
  * electrical standard. This file is not considered part of the API and should
  * not be included by the user.
  */

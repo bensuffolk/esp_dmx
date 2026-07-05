@@ -49,12 +49,6 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
   dmx_driver_t *const driver = arg;
   const dmx_port_t dmx_num = driver->dmx_num;
   int task_awoken = false;
-  // This variable was created to count the number of byte that are received between the DMX Breaks. This allows the 
-  // length to be updated in real time from frame to frame. Previously this code would only update the length if a break was 
-  // detected while the state machine was still processing data. However, that was the bug in this software. Because the processing 
-  // of data would get out of sync with the flow of data and the length would be incorrectly assigned. Having the length always 
-  // be validated ensures it can re-sync after framing errors on the bus
-  static uint16_t dmxFrameLengthTracker = 0;
 
   // This is an interesting way to handle the UART receive ISR - but we will basically stay in here so long as there is data to process
   while (true) {
@@ -63,6 +57,12 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
 
     // If there are no valid interrupt flags set then leave the ISR
     if (intr_flags == 0) break;
+
+    // Moved the clear flags to the here as the ESP32S3 has a peripheral pipeline that means it can take a few clock
+    // cycles to clear. If we do that at the end of the loop then go pack to the dmx_uart_get_interrupt_status on the very next
+    // instruction it can block until the pipeline is clear. By doing it early we let the pipline clear whilst processing our ISR
+    // and therfore save any blocking when we get back to the top of the loop. Clearing early will have no detremental effects.
+    dmx_uart_clear_interrupt(dmx_num, intr_flags & (DMX_INTR_RX_ALL | DMX_INTR_TX_DATA | DMX_INTR_TX_DONE));
 
     // DMX Receive (DMX_INTR_RX_ALL) ####################################################
     // This section of code is entered when there is either:
@@ -81,9 +81,8 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
         // Call the low level peripheral functions to read the data. Pass in read_len as the maximum amount of data that can be read from the peripheral buffer. 
         // If the number of bytes in the peripheral buffer is less than the read_len then read_len will be updated with how many bytes are actually available.
         dmx_uart_read_rxfifo(dmx_num, &driver->dmx.data[dmx_head], &read_len);
-        // Increment both the head pointer of the buffer as well as the new dmxFrameLengthTracker to track how much data has been read in
+        // Increment the head pointer of the buffer
         dmx_head += read_len;
-        dmxFrameLengthTracker += read_len;
         taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
         driver->dmx.head = dmx_head;
         taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
@@ -98,19 +97,11 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
         dmx_uart_rxfifo_reset(dmx_num);
       }
 
-      // Since right above here we've read the received data from the UART peripheral it is now OK to clear the Receive Data Flag
-      dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_DATA);
-
       // Handle UART error condition - the previous code handled the break before the error but again this could lead to race conditions when the 
       // cable insertion and removal caused framing errors.
       if (intr_flags & DMX_INTR_RX_ERR) {
-        // Since the receive error is being handled - clear the flag in the peripheral
-        dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_ERR);
-        // Since a receive error has just happened - also clear break flag in the peripheral so the next frame is ignored 
-        dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_BREAK);
-
         // On error - reset all the driver variables
-        taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));      
+        taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
         driver->dmx.head = DMX_HEAD_WAITING_FOR_BREAK;
         driver->dmx.size = DMX_PACKET_SIZE_MAX; 
         driver->dmx.status = DMX_STATUS_IDLE;
@@ -125,7 +116,6 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
       } 
       else if (intr_flags & DMX_INTR_RX_BREAK) {
         // Handle DMX break condition - when a break has been detected it means this is the start of a brand new DMX or RDM frame
-        dmx_uart_clear_interrupt(dmx_num, DMX_INTR_RX_BREAK);
         
         // For debugging purposes - set GPIO13 LOW when handling the UART Break ISR bits
         // gpio_set_level(GPIO_NUM_13, 0);
@@ -140,22 +130,6 @@ static void DMX_ISR_ATTR dmx_uart_isr(void *arg) {
           }
           taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num)); 
         }
-
-        // Now handle the condition where the DMX Frame Length has changed - this typically happens when inserting and removing the cable
-        // and data frames are not fully received. Once the data stream is consistent then the dmx.size will be equal to dmxFrameLengthTracker
-        // and this logic will no longer be executed -
-        // 11/7/2024 - extended this logic to only perform length adjustment when the start code is 0x00 for a DMX packet
-        // this is because if there was an RDM frame of 22 bytes followed by a DMX frame of 512B the DMX frame would be provided to the App after only the 
-        // first 22B and not the entire frame. Therefore, if the frame is anything other than DMX do not bother updating the length
-        if((dmxFrameLengthTracker != 0) && (dmxFrameLengthTracker != driver->dmx.size) && (driver->dmx.data[0] == 0x00)) {
-          taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
-          // Update dmx frame size based on how many bytes have been receieved between this BREAK and the last BREAK
-          driver->dmx.size = (dmxFrameLengthTracker - 1);  
-          taskEXIT_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
-        }
-
-        // Since this was a BREAK we can clear the dmxFrameLengthTracker back to 0 and begin counting again when the next BYTE is received
-        dmxFrameLengthTracker = 0;
 
         // Reset the DMX buffer for the next packet
         taskENTER_CRITICAL_ISR(DMX_SPINLOCK(dmx_num));
@@ -462,6 +436,15 @@ bool dmx_uart_init(dmx_port_t dmx_num, void *isr_context, int isr_flags) {
 
   dmx_uart_rxfifo_reset(dmx_num);
   dmx_uart_txfifo_reset(dmx_num);
+
+  // Set the RX timeout to 12 bits (Thast 1 more than Start + 8 Datat + 2 Stop)
+  uart_set_rx_timeout(dmx_num, 12);
+
+#if SOC_UART_SUPPORT_WAKEUP_INT
+  // Ensure framing error data isn't dropped
+  uart_ll_discard_error_data(uart->dev, false);
+#endif
+
   dmx_uart_disable_interrupt(dmx_num, UART_LL_INTR_MASK);
   dmx_uart_clear_interrupt(dmx_num, UART_LL_INTR_MASK);
 
